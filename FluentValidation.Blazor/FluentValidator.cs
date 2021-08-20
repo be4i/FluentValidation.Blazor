@@ -6,6 +6,7 @@ using System;
 using System.Collections.Generic;
 using FluentValidation.Internal;
 using System.Threading.Tasks;
+using System.Linq;
 
 namespace Microsoft.AspNetCore.Components.Forms
 {
@@ -24,12 +25,14 @@ namespace Microsoft.AspNetCore.Components.Forms
         /// Enable access to the ASP.NET Core Service Provider / DI.
         /// </summary>
         [Inject]
-        private IServiceProvider ServiceProvider { get; set; }
+        private IServiceProvider InjectedServiceProvider { get; set; }
 
-        /// <summary>
-        /// Isolate scoped DbContext to this component.
-        /// </summary>
+        [CascadingParameter]
+        private IServiceProvider CascadingServiceProvider { get; set; }
+
+        private IServiceProvider ServiceProvider { get; set; }
         private IServiceScope ServiceScope { get; set; }
+        private ValidationMessageStore MessageStore { get; set; }
 
         /// <summary>
         /// The AbstractValidator object for the corresponding form Model object type.
@@ -43,6 +46,18 @@ namespace Microsoft.AspNetCore.Components.Forms
         [Parameter]
         public Dictionary<Type, IValidator> ChildValidators { set; get; } = new Dictionary<Type, IValidator>();
 
+        [Parameter]
+        public bool ValidateModelOnFieldChange { set; get; }
+
+        [Parameter]
+        public bool SuppressCascadingServiceProvider { set; get; }
+
+        [Parameter]
+        public bool UseServiceScope { set; get; }
+
+        [Parameter]
+        public string ValidatorRuleSets { get; set; }
+
         /// <summary>
         /// Attach to parent EditForm context enabling validation.
         /// </summary>
@@ -55,7 +70,22 @@ namespace Microsoft.AspNetCore.Components.Forms
                     $"inside an EditForm.");
             }
 
-            this.ServiceScope = ServiceProvider.CreateScope();
+            MessageStore = new ValidationMessageStore(CurrentEditContext);
+
+            if (CascadingServiceProvider is not null && !SuppressCascadingServiceProvider)
+            {
+                ServiceProvider = CascadingServiceProvider;
+            }
+            else
+            {
+                ServiceProvider = InjectedServiceProvider;
+            }
+
+            if (UseServiceScope)
+            {
+                ServiceScope = ServiceProvider.CreateScope();
+                ServiceProvider = ServiceScope.ServiceProvider;
+            }
 
             if (this.Validator == null)
             {
@@ -88,7 +118,7 @@ namespace Microsoft.AspNetCore.Components.Forms
         {
             var validatorType = typeof(IValidator<>);
             var formValidatorType = validatorType.MakeGenericType(modelType);
-            return ServiceScope.ServiceProvider.GetService(formValidatorType) as IValidator;
+            return ServiceProvider.GetService(formValidatorType) as IValidator;
         }
 
         /// <summary>
@@ -97,20 +127,29 @@ namespace Microsoft.AspNetCore.Components.Forms
         /// <param name="model"></param>
         /// <param name="validatorSelector"></param>
         /// <returns></returns>
-        private IValidationContext CreateValidationContext(object model, IValidatorSelector validatorSelector = null)
+        private IValidationContext CreateValidationContext(object model, IEnumerable<string> properties, IEnumerable<string> ruleSets)
         {
-            // This method is required due to breaking changes in FluentValidation 9!
-            // https://docs.fluentvalidation.net/en/latest/upgrading-to-9.html#removal-of-non-generic-validate-overload
-
-            if (validatorSelector == null)
-            {
-                // No selector specified - use the default.
-                validatorSelector = ValidatorOptions.Global.ValidatorSelectors.DefaultValidatorSelectorFactory();
-            }
-
             // Don't need to use reflection to construct the context. 
             // If you create it as a ValidationContext<object> instead of a ValidationContext<T> then FluentValidation will perform the conversion internally, assuming the types are compatible. 
-            var context = new ValidationContext<object>(model, new PropertyChain(), validatorSelector);
+            var context = ValidationContext<object>.CreateWithOptions(model, opts =>
+            {
+                var selectors = new List<IValidatorSelector>(2);
+
+                if (properties is not null && properties.Any())
+                {
+                    selectors.Add(ValidatorOptions.Global.ValidatorSelectors.MemberNameValidatorSelectorFactory(properties.ToArray()));
+                }
+
+                if (ruleSets is not null && ruleSets.Any())
+                {
+                    selectors.Add(ValidatorOptions.Global.ValidatorSelectors.RulesetValidatorSelectorFactory(ruleSets.ToArray()));
+                }
+
+                if (selectors.Any())
+                {
+                    opts.UseCustomSelector(selectors.Count == 1 ? selectors[0] : new CompositeValidatorSelector(selectors));
+                }
+            });
 
             // InjectValidator looks for a service provider inside the ValidationContext with this key. 
             context.RootContextData["_FV_ServiceProvider"] = ServiceProvider;
@@ -121,16 +160,33 @@ namespace Microsoft.AspNetCore.Components.Forms
         /// Add form validation logic handlers.
         /// </summary>
         private void AddValidation()
-        {
-            var messages = new ValidationMessageStore(CurrentEditContext);
-
+        {             
             // Perform object-level validation on request
             CurrentEditContext.OnValidationRequested +=
-                (sender, eventArgs) => ValidateModel((EditContext)sender, messages);
+                (sender, eventArgs) => _ = ValidateModel(ValidatorRuleSets);
 
             // Perform per-field validation on each field edit
-            CurrentEditContext.OnFieldChanged +=
-                (sender, eventArgs) => ValidateField(CurrentEditContext, messages, eventArgs.FieldIdentifier);
+            CurrentEditContext.OnFieldChanged += (sender, eventArgs) =>
+            {
+                if (ValidateModelOnFieldChange)
+                {
+                    _ = ValidateModel(ValidatorRuleSets);
+                }
+                else
+                {
+                    ValidateField(CurrentEditContext, eventArgs.FieldIdentifier);
+                }
+            };
+        }
+
+        public Task<bool> ValidateModel(string rulesets)
+        {
+            return ValidateModel(rulesets?.Split(','));
+        }
+
+        public Task<bool> ValidateModel(params string[] rulesets)
+        {
+            return ValidateModel(rulesets?.AsEnumerable());
         }
 
         /// <summary>
@@ -138,14 +194,14 @@ namespace Microsoft.AspNetCore.Components.Forms
         /// </summary>
         /// <param name="editContext"></param>
         /// <param name="messages"></param>
-        private async void ValidateModel(EditContext editContext, ValidationMessageStore messages)
+        public async Task<bool> ValidateModel(IEnumerable<string> ruleSets = null)
         {
             // <EditForm> should now be able to run async validations:
             // https://github.com/dotnet/aspnetcore/issues/11914
-            var validationResults = await TryValidateModel(editContext);
-            messages.Clear();
+            var validationResults = await TryValidateModel(CurrentEditContext, ruleSets);
+            MessageStore.Clear();
 
-            var graph = new ModelGraphCache(editContext.Model);
+            var graph = new ModelGraphCache(CurrentEditContext.Model);
             foreach (var error in validationResults.Errors)
             {
                 var (propertyValue, propertyName) = graph.EvalObjectProperty(error.PropertyName);
@@ -153,11 +209,13 @@ namespace Microsoft.AspNetCore.Components.Forms
                 if (propertyValue != null)
                 {
                     var fieldID = new FieldIdentifier(propertyValue, propertyName);
-                    messages.Add(fieldID, error.ErrorMessage);
+                    MessageStore.Add(fieldID, error.ErrorMessage);
                 }
             }
 
-            editContext.NotifyValidationStateChanged();
+            CurrentEditContext.NotifyValidationStateChanged();
+
+            return CurrentEditContext.GetValidationMessages().Any();
         }
 
         /// <summary>
@@ -165,12 +223,12 @@ namespace Microsoft.AspNetCore.Components.Forms
         /// </summary>
         /// <param name="editContext"></param>
         /// <returns></returns>
-        private async Task<ValidationResult> TryValidateModel(EditContext editContext)
+        private async Task<ValidationResult> TryValidateModel(EditContext editContext, IEnumerable<string> ruleSets)
         {
             try
             {
-                var validationContext = CreateValidationContext(editContext.Model);
-                return await Validator.ValidateAsync(validationContext);
+                var validationContext = CreateValidationContext(editContext.Model, null, ruleSets);
+                return await ValidatorValidate(Validator, validationContext);
             }
             catch (Exception ex)
             {
@@ -190,9 +248,8 @@ namespace Microsoft.AspNetCore.Components.Forms
         {
             try
             {
-                var vselector = new MemberNameValidatorSelector(new[] { fieldIdentifier.FieldName });
-                var vctx = CreateValidationContext(fieldIdentifier.Model, validatorSelector: vselector);
-                return await validator.ValidateAsync(vctx);
+                var vctx = CreateValidationContext(fieldIdentifier.Model, new[] { fieldIdentifier.FieldName }, ValidatorRuleSets?.Split(','));
+                return await ValidatorValidate(validator, vctx);
             }
             catch (Exception ex)
             {
@@ -238,7 +295,7 @@ namespace Microsoft.AspNetCore.Components.Forms
         /// <param name="editContext"></param>
         /// <param name="messages"></param>
         /// <param name="fieldIdentifier"></param>
-        private async void ValidateField(EditContext editContext, ValidationMessageStore messages, FieldIdentifier fieldIdentifier)
+        private async void ValidateField(EditContext editContext, FieldIdentifier fieldIdentifier)
         {
             var fieldValidator = TryGetFieldValidator(editContext, fieldIdentifier);
             if (fieldValidator == null)
@@ -248,14 +305,19 @@ namespace Microsoft.AspNetCore.Components.Forms
             }
 
             var validationResults = await TryValidateField(fieldValidator, editContext, fieldIdentifier);
-            messages.Clear(fieldIdentifier);
+            MessageStore.Clear(fieldIdentifier);
 
             foreach (var error in validationResults.Errors)
             {
-                messages.Add(fieldIdentifier, error.ErrorMessage);
+                MessageStore.Add(fieldIdentifier, error.ErrorMessage);
             }
 
             editContext.NotifyValidationStateChanged();
+        }
+
+        protected virtual async Task<ValidationResult> ValidatorValidate(IValidator validator, IValidationContext context)
+        {
+            return await validator.ValidateAsync(context);
         }
 
         #region IDisposable Support
@@ -268,15 +330,17 @@ namespace Microsoft.AspNetCore.Components.Forms
                 if (disposing)
                 {
                     // Dispose managed state (managed objects).
-                    ServiceScope.Dispose();
+                    ServiceScope?.Dispose();
                 }
 
                 // Free unmanaged resources (unmanaged objects) and override a finalizer below.
 
                 // Set large fields to null.
+                ServiceProvider = null;
                 ServiceScope = null;
                 Validator = null;
                 ChildValidators = null;
+                MessageStore = null;
 
                 disposedValue = true;
             }

@@ -68,11 +68,11 @@ namespace Accelist.FluentValidation.Blazor
                 // Constructing model object path here allows capturing the same array objects without the index!
                 if (string.IsNullOrEmpty(modelObjectPath))
                 {
-                    modelObjectPath = propertyName;
+                    modelObjectPath = objectParts[i];
                 }
                 else
                 {
-                    modelObjectPath += "." + propertyName;
+                    modelObjectPath += "." + objectParts[i];
                 }
 
                 // Locally cache objects found along the way to prevent slow multiple reflection method calls
